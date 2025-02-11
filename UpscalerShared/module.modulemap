@@ -1,0 +1,8 @@
+framework module UpscalerShared {
+    umbrella header "UpscalerShared.h"
+    
+    requires objc
+    
+    export *
+    module * { export * }
+} 
