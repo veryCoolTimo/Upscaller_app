@@ -1,6 +1,7 @@
 import Foundation
 import os.log
 
+@objcMembers
 @objc public class ImageUpscaler: NSObject, NSSecureCoding {
     public static let shared = ImageUpscaler()
     private var connection: NSXPCConnection?
@@ -48,7 +49,7 @@ import os.log
         
         // Настраиваем интерфейсы
         logger.debug("Настройка интерфейсов XPC")
-        newConnection.remoteObjectInterface = NSXPCInterface(with: ImageUpscalerServiceProtocol.self)
+        newConnection.remoteObjectInterface = NSXPCInterface(with: ImageUpscalerProtocol.self)
         newConnection.exportedInterface = NSXPCInterface(with: NSObjectProtocol.self)
         newConnection.exportedObject = self
         
@@ -80,7 +81,7 @@ import os.log
         connection?.resume()
         
         // Проверяем, что соединение активно
-        if connection?.remoteObjectProxy as? ImageUpscalerServiceProtocol != nil {
+        if connection?.remoteObjectProxy as? ImageUpscalerProtocol != nil {
             logger.debug("XPC соединение успешно установлено и получен прокси сервиса")
         } else {
             logger.error("Не удалось получить remoteObjectProxy после установки соединения")
@@ -110,8 +111,9 @@ import os.log
     public func setProgressCallback(_ callback: @escaping (String) -> Void) {
         logger.debug("Установка callback для прогресса")
         self.progressCallback = callback
-        if let service = connection?.remoteObjectProxy as? ImageUpscalerServiceProtocol {
-            service.addProgressObserver(self) { [weak self] message in
+        if let service = connection?.remoteObjectProxy as? ImageUpscalerProtocol {
+            let observerId = String(describing: ObjectIdentifier(self))
+            service.addProgressObserver(observerId) { [weak self] message in
                 self?.logger.debug("Получено сообщение о прогрессе: \(message)")
                 self?.progressCallback?(message)
             }
@@ -122,6 +124,16 @@ import os.log
     
     public func upscaleImage(at inputPath: String, outputPath: String, scale: Int = 2) async throws {
         logger.debug("Начало обработки изображения. Путь входного файла: \(inputPath)")
+        logger.debug("Выходной путь: \(outputPath)")
+        logger.debug("Масштаб: \(scale)")
+        
+        // Проверяем существование входного файла
+        if !FileManager.default.fileExists(atPath: inputPath) {
+            logger.error("Входной файл не существует: \(inputPath)")
+            throw NSError(domain: "ImageUpscaler",
+                         code: 1,
+                         userInfo: [NSLocalizedDescriptionKey: "Input file does not exist: \(inputPath)"])
+        }
         
         guard let connection = connection else {
             logger.error("XPC соединение отсутствует")
@@ -130,7 +142,7 @@ import os.log
                          userInfo: [NSLocalizedDescriptionKey: "XPC connection not available"])
         }
         
-        guard let service = connection.remoteObjectProxy as? ImageUpscalerServiceProtocol else {
+        guard let service = connection.remoteObjectProxy as? ImageUpscalerProtocol else {
             logger.error("Не удалось получить remoteObjectProxy")
             throw NSError(domain: "ImageUpscaler",
                          code: 3,
@@ -142,15 +154,38 @@ import os.log
             
             // Создаем DispatchWorkItem для таймаута
             let timeoutWork = DispatchWorkItem { [weak self] in
-                self?.logger.error("Таймаут операции upscaleImage")
+                self?.logger.error("Таймаут операции upscaleImage после 180 секунд ожидания")
                 continuation.resume(throwing: NSError(domain: "ImageUpscaler",
                                                    code: 4,
-                                                   userInfo: [NSLocalizedDescriptionKey: "Operation timeout"]))
+                                                   userInfo: [NSLocalizedDescriptionKey: "Operation timeout after 180 seconds"]))
             }
             
-            // Устанавливаем таймаут
-            logger.debug("Установка таймаута 30 секунд")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 30, execute: timeoutWork)
+            // Устанавливаем таймаут в 180 секунд вместо 120
+            logger.debug("Установка таймаута 180 секунд")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 180, execute: timeoutWork)
+            
+            // Добавляем периодическое логирование для отслеживания прогресса
+            for i in 1...17 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + Double(i * 10)) { [weak self] in
+                    if !timeoutWork.isCancelled {
+                        self?.logger.debug("Операция выполняется уже \(i * 10) секунд...")
+                        
+                        // Проверяем существование выходного файла каждые 10 секунд
+                        if FileManager.default.fileExists(atPath: outputPath) {
+                            if let attributes = try? FileManager.default.attributesOfItem(atPath: outputPath),
+                               let fileSize = attributes[.size] as? UInt64, fileSize > 0 {
+                                self?.logger.debug("Выходной файл существует, размер: \(fileSize) байт")
+                                
+                                // Если файл существует и имеет ненулевой размер, но callback еще не вызван,
+                                // возможно, XPC сервис завис после создания файла
+                                if i >= 6 && !timeoutWork.isCancelled { // Проверяем после 60 секунд
+                                    self?.logger.debug("Выходной файл существует, но callback не вызван. Возможно, XPC сервис завис.")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             
             service.upscaleImage(inputPath: inputPath, outputPath: outputPath, scale: scale) { [weak self] error in
                 guard let self = self else { return }
@@ -163,8 +198,25 @@ import os.log
                     self.logger.error("Ошибка при обработке изображения: \(error.localizedDescription)")
                     continuation.resume(throwing: error)
                 } else {
-                    self.logger.debug("Обработка изображения завершена успешно")
-                    continuation.resume(returning: ())
+                    // Проверяем существование выходного файла
+                    if FileManager.default.fileExists(atPath: outputPath) {
+                        if let attributes = try? FileManager.default.attributesOfItem(atPath: outputPath),
+                           let fileSize = attributes[.size] as? UInt64, fileSize > 0 {
+                            self.logger.debug("Выходной файл существует, размер: \(fileSize) байт")
+                            self.logger.debug("Обработка изображения завершена успешно")
+                            continuation.resume(returning: ())
+                        } else {
+                            self.logger.error("Выходной файл существует, но имеет нулевой размер")
+                            continuation.resume(throwing: NSError(domain: "ImageUpscaler",
+                                                               code: 5,
+                                                               userInfo: [NSLocalizedDescriptionKey: "Output file exists but has zero size"]))
+                        }
+                    } else {
+                        self.logger.error("Выходной файл не существует, хотя сервис сообщил об успешном завершении")
+                        continuation.resume(throwing: NSError(domain: "ImageUpscaler",
+                                                           code: 6,
+                                                           userInfo: [NSLocalizedDescriptionKey: "Output file does not exist after successful completion"]))
+                    }
                 }
             }
         }
@@ -172,8 +224,9 @@ import os.log
     
     deinit {
         logger.debug("Деинициализация ImageUpscaler")
-        if let service = connection?.remoteObjectProxy as? ImageUpscalerServiceProtocol {
-            service.removeProgressObserver(self)
+        if let service = connection?.remoteObjectProxy as? ImageUpscalerProtocol {
+            let observerId = String(describing: ObjectIdentifier(self))
+            service.removeProgressObserver(observerId)
         }
         connection?.invalidate()
     }

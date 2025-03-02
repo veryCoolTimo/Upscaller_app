@@ -7,6 +7,7 @@
 
 import Foundation
 import os.log
+import UpscalerShared
 
 let logger = Logger(subsystem: "Timob.ImageUpscalerService", category: "XPCService")
 
@@ -18,7 +19,7 @@ class ServiceDelegate: NSObject, NSXPCListenerDelegate {
         
         // Configure the connection.
         // First, set the interface that the exported object implements.
-        newConnection.exportedInterface = NSXPCInterface(with: ImageUpscalerServiceProtocol.self)
+        newConnection.exportedInterface = NSXPCInterface(with: ImageUpscalerProtocol.self)
         newConnection.remoteObjectInterface = NSXPCInterface(with: NSObjectProtocol.self)
         
         // Next, set the object that the connection exports. All messages sent on the connection to this service will be sent to the exported object to handle. The connection retains the exported object.
